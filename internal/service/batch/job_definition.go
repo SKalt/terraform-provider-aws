@@ -26,6 +26,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
+	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/retry"
@@ -35,12 +36,22 @@ import (
 	"github.com/hashicorp/terraform-provider-aws/internal/framework"
 	"github.com/hashicorp/terraform-provider-aws/internal/framework/flex"
 	fwtypes "github.com/hashicorp/terraform-provider-aws/internal/framework/types"
+	"github.com/hashicorp/terraform-provider-aws/internal/tags"
 	tftags "github.com/hashicorp/terraform-provider-aws/internal/tags"
 	"github.com/hashicorp/terraform-provider-aws/internal/tfresource"
 	"github.com/hashicorp/terraform-provider-aws/names"
 )
 
+// Note: this resource frequently changes its ARN with a `:${revision}` suffix.
+// Thus, it's computed **without** a `UseStateForUnknown()` plan modifier, since
+// using using a prior ARN in the plan would introduce a discrepancy with the post-apply ARN.
+// Avoiding `UseStateForUnknown` means the ARN becomes unknown before updates, which
+// breaks transparent tagging (see internal/provider/fwprovider/intercept.go).
+// This means we have to eject from transparent tagging and handle tag updates ourself.
+//
+// not using:
 // @Tags(identifierAttribute="arn")
+
 // @Testing(importIgnore="deregister_on_new_revision")
 // @FrameworkResource("aws_batch_job_definition", name="Job Definition")
 func newResourceJobDefinition(_ context.Context) (resource.ResourceWithConfigure, error) {
@@ -889,14 +900,19 @@ func (r *resourceJobDefinition) SchemaEKSProperties(ctx context.Context) schema.
 func (r *resourceJobDefinition) Schema(ctx context.Context, req resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
 		Attributes: map[string]schema.Attribute{
+			// The ID includes the batch job definition version, and so it changes every time the job definition is updated.
+			// As a result we can't use
+			// - names.AttrID:  framework.IDAttribute(),
+			// - names.AttrARN: framework.ARNAttributeComputedOnly(),
+			//  due to the plan modifier .UseStateForUnknown()
 			names.AttrARN: schema.StringAttribute{
 				Computed: true,
+				// PlanModifiers: []planmodifier.String{
+				// 	&funkyStringPlanModifier{},
+				// },
 			},
-			// The ID includes the batch job definition version, and so it updates everytime
-			// As a result we can't use framework.IDAttribute() do the plan modifier UseStateForUnknown
-			names.AttrID: schema.StringAttribute{
-				Computed: true,
-			},
+			names.AttrID: schema.StringAttribute{Computed: true},
+
 			"arn_prefix": schema.StringAttribute{
 				Computed: true,
 				PlanModifiers: []planmodifier.String{
@@ -952,8 +968,8 @@ func (r *resourceJobDefinition) Schema(ctx context.Context, req resource.SchemaR
 			"scheduling_priority": schema.Int32Attribute{
 				Optional: true,
 			},
-			names.AttrTags:    tftags.TagsAttribute(),
-			names.AttrTagsAll: tftags.TagsAttributeComputedOnly(),
+			names.AttrTags:    tftags.TagsAttribute(),             // <-
+			names.AttrTagsAll: tftags.TagsAttributeComputedOnly(), // <-
 
 			names.AttrType: schema.StringAttribute{
 				Required: true,
@@ -1211,10 +1227,15 @@ func (r *resourceJobDefinition) Create(ctx context.Context, req resource.CreateR
 		return
 	}
 
+	tagsAll, diagnostics := r.getTagsAllMap(ctx, req.Plan)
+	if resp.Diagnostics.Append(diagnostics...); resp.Diagnostics.HasError() {
+		return
+	}
+
 	input := &batch.RegisterJobDefinitionInput{
 		JobDefinitionName: plan.Name.ValueStringPointer(),
 		Type:              awstypes.JobDefinitionType(plan.Type.ValueString()),
-		Tags:              getTagsIn(ctx),
+		Tags:              tagsAll,
 	}
 	resp.Diagnostics.Append(flex.Expand(ctx, plan, input)...)
 	if resp.Diagnostics.HasError() {
@@ -1314,7 +1335,7 @@ func (r *resourceJobDefinition) Read(ctx context.Context, req resource.ReadReque
 		return
 	}
 
-	setTagsOut(ctx, out.Tags)
+	setTagsOut(ctx, out.Tags) // FIXME: !!!
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
@@ -1329,66 +1350,115 @@ func (r *resourceJobDefinition) Update(ctx context.Context, req resource.UpdateR
 		return
 	}
 
-	input := &batch.RegisterJobDefinitionInput{
-		JobDefinitionName: state.Name.ValueStringPointer(),
-		Tags:              getTagsIn(ctx),
-		Type:              awstypes.JobDefinitionType(plan.Type.ValueString()),
-	}
-
-	resp.Diagnostics.Append(flex.Expand(ctx, plan, input)...)
-	if resp.Diagnostics.HasError() {
+	planTagsAll, ds := r.getTagsAllMap(ctx, req.Plan)
+	if resp.Diagnostics.Append(ds...); resp.Diagnostics.HasError() {
 		return
 	}
 
-	if resp.Diagnostics.HasError() {
+	shouldDoFullUpdate, ds := __nonTagChange(ctx, req.State, req.Plan)
+	if resp.Diagnostics.Append(ds...); resp.Diagnostics.HasError() {
 		return
 	}
+	if shouldDoFullUpdate {
+		input := &batch.RegisterJobDefinitionInput{
+			JobDefinitionName: state.Name.ValueStringPointer(),
+			Tags:              planTagsAll,
+			Type:              awstypes.JobDefinitionType(plan.Type.ValueString()),
+		}
 
-	out, err := conn.RegisterJobDefinition(ctx, input)
-	if err != nil {
-		resp.Diagnostics.AddError(
-			create.ProblemStandardMessage(names.Batch, create.ErrActionCreating, ResNameJobDefinition, plan.Name.String(), err),
-			err.Error(),
-		)
-		return
-	}
-	if out == nil || out.JobDefinitionArn == nil {
-		resp.Diagnostics.AddError(
-			create.ProblemStandardMessage(names.Batch, create.ErrActionCreating, ResNameJobDefinition, plan.Name.String(), nil),
-			errors.New("empty output").Error(),
-		)
-		return
-	}
+		resp.Diagnostics.Append(flex.Expand(ctx, plan, input)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
 
-	jd, err := findJobDefinitionByARN(ctx, conn, *out.JobDefinitionArn)
-	if err != nil || jd == nil {
-		resp.Diagnostics.AddError(
-			create.ProblemStandardMessage(names.Batch, create.ErrActionSetting, ResNameJobDefinition, plan.ID.String(), err),
-			err.Error(),
-		)
-		return
-	}
-	resp.Diagnostics.Append(r.readJobDefinitionIntoState(ctx, jd, &plan)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
 
-	if plan.DeregisterOnNewRevision.ValueBool() {
-		tflog.Debug(ctx, fmt.Sprintf("[DEBUG] Deleting previous Batch Job Definition: %s", state.ID.ValueString()))
-		_, err := conn.DeregisterJobDefinition(ctx, &batch.DeregisterJobDefinitionInput{
-			JobDefinition: state.ID.ValueStringPointer(),
-		})
-
+		out, err := conn.RegisterJobDefinition(ctx, input)
 		if err != nil {
 			resp.Diagnostics.AddError(
-				create.ProblemStandardMessage(names.Batch, create.ErrActionDeleting, ResNameJobDefinition, aws.ToString(out.JobDefinitionArn), nil),
+				create.ProblemStandardMessage(names.Batch, create.ErrActionCreating, ResNameJobDefinition, plan.Name.String(), err),
 				err.Error(),
 			)
 			return
 		}
+		if out == nil || out.JobDefinitionArn == nil {
+			resp.Diagnostics.AddError(
+				create.ProblemStandardMessage(names.Batch, create.ErrActionCreating, ResNameJobDefinition, plan.Name.String(), nil),
+				errors.New("empty output").Error(),
+			)
+			return
+		}
+
+		jd, err := findJobDefinitionByARN(ctx, conn, *out.JobDefinitionArn)
+		if err != nil || jd == nil {
+			resp.Diagnostics.AddError(
+				create.ProblemStandardMessage(names.Batch, create.ErrActionSetting, ResNameJobDefinition, plan.ID.String(), err),
+				err.Error(),
+			)
+			return
+		}
+		resp.Diagnostics.Append(r.readJobDefinitionIntoState(ctx, jd, &plan)...)
+
+		if plan.DeregisterOnNewRevision.ValueBool() {
+			tflog.Debug(ctx, fmt.Sprintf("[DEBUG] Deleting previous Batch Job Definition: %s", state.ID.ValueString()))
+			_, err := conn.DeregisterJobDefinition(ctx, &batch.DeregisterJobDefinitionInput{
+				JobDefinition: state.ID.ValueStringPointer(),
+			})
+
+			if err != nil {
+				resp.Diagnostics.AddError(
+					create.ProblemStandardMessage(names.Batch, create.ErrActionDeleting, ResNameJobDefinition, aws.ToString(out.JobDefinitionArn), nil),
+					err.Error(),
+				)
+				return
+			}
+		}
+		resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+	} else {
+		stateTagsAll, ds := r.getTagsAllKv(ctx, req.State)
+		if resp.Diagnostics.Append(ds...); resp.Diagnostics.HasError() {
+			return
+		}
+		{ // delete unwanted tags
+			deletedTags := []string{}
+			for t := range stateTagsAll {
+				if _, ok := planTagsAll[t]; !ok {
+					deletedTags = append(deletedTags, t)
+				}
+			}
+			input := batch.UntagResourceInput{
+				ResourceArn: new(string),
+				TagKeys:     deletedTags,
+			}
+			conn.UntagResource(ctx, &input)
+		}
+		{ // add the desired tags
+			input := batch.TagResourceInput{
+				ResourceArn: state.ARN.ValueStringPointer(),
+				Tags:        planTagsAll,
+			}
+			conn.TagResource(ctx, &input)
+		}
+		jd, err := findJobDefinitionByARN(ctx, conn, *state.ARN.ValueStringPointer())
+		if err != nil || jd == nil {
+			resp.Diagnostics.AddError(
+				create.ProblemStandardMessage(names.Batch, create.ErrActionSetting, ResNameJobDefinition, plan.ID.String(), err),
+				err.Error(),
+			)
+			return
+		}
+		resp.Diagnostics.Append(r.readJobDefinitionIntoState(ctx, jd, &plan)...)
+
+		resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 	}
 
-	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
 func (r *resourceJobDefinition) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
+	ctx = tflog.SetField(ctx, "debug-op", "Delete")
+
 	conn := r.Meta().BatchClient(ctx)
 
 	var state resourceJobDefinitionModel
@@ -1429,11 +1499,186 @@ func (r *resourceJobDefinition) Delete(ctx context.Context, req resource.DeleteR
 }
 
 func (r *resourceJobDefinition) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
+	// ctx = tflog.SetField(ctx, "debug-op", "ImportState")
 	resource.ImportStatePassthroughID(ctx, path.Root(names.AttrID), req, resp)
+	// // DEBUG: it ain't this. Read always gets called and fixes the ARN.
+	// var model resourceJobDefinitionModel
+	// if ds := resp.State.Get(ctx, &model); ds.HasError() {
+	// 	panic(ds)
+	// }
+	// if model.ARN.IsUnknown() {
+	// 	tflog.Warn(ctx, "importState:: unknown arn")
+	// } else if model.ARN.IsNull() {
+	// 	tflog.Warn(ctx, "importState:: null arn")
+	// }
 }
 
+type getter interface { // FIXME: rename
+	Get(ctx context.Context, target interface{}) diag.Diagnostics
+	GetAttribute(ctx context.Context, path path.Path, target interface{}) diag.Diagnostics
+}
+
+func __getTags[Getter getter](ctx context.Context, g Getter) (tftags.Map, diag.Diagnostics) {
+	var result tftags.Map
+	diagnostics := g.GetAttribute(ctx, path.Root(names.AttrTags), &result)
+	return result, diagnostics
+}
+func __tagsMustBeFullyKnown(m tftags.Map) (diagnostics diag.Diagnostics) {
+	if m.IsUnknown() {
+		diagnostics.AddError("unknown tags map", "")
+		return
+	}
+
+	for k, v := range m.Elements() {
+		if v.IsUnknown() {
+			diagnostics.AddError("unknown element encountered during construction of concrete tag map", k)
+			return
+		}
+	}
+	return
+}
+
+func (r *resourceJobDefinition) getResourceTags(ctx context.Context, val getter) (resourceTags tags.KeyValueTags, diagnostics diag.Diagnostics) {
+	var planTags tftags.Map
+	diagnostics.Append(val.GetAttribute(ctx, path.Root(names.AttrTags), &planTags)...)
+	if diagnostics.HasError() {
+		return
+	}
+	if diagnostics.Append(__tagsMustBeFullyKnown(planTags)...); diagnostics.HasError() {
+		return
+	}
+	resourceTags = tftags.New(ctx, planTags)
+	return
+}
+
+// func __tagsHaveChange(ctx context.Context, state tfsdk.State, plan tfsdk.Plan) (tagsHaveChange bool, diagnostics diag.Diagnostics) {
+// 	var stateTags, planTags tftags.Map
+// 	stateTags, diagnostics = __getTags(ctx, state)
+// 	if diagnostics.HasError() {
+// 		return
+// 	}
+// 	planTags, diagnostics = __getTags(ctx, plan)
+// 	if diagnostics.HasError() {
+// 		return
+// 	}
+// 	return false, nil
+// }
+
+func __nonTagChange(ctx context.Context, state tfsdk.State, plan tfsdk.Plan) (nonTagChangeDetected bool, diagnostics diag.Diagnostics) {
+	diff, err := state.Raw.Diff(plan.Raw)
+	if err != nil {
+		diagnostics.AddError("failed to diff", err.Error())
+		return
+	}
+	// HACK: use string comparison to check diffs under tags, tagsAll
+	_tagsPrefix := path.Root(names.AttrTags).String()
+	_tagsAllPrefix := path.Root(names.AttrTagsAll).String()
+	for _, d := range diff {
+		// filter out diffs in tags/tagsAll
+		if !strings.HasPrefix(d.Path.String(), _tagsPrefix) && !strings.HasPrefix(d.Path.String(), _tagsAllPrefix) {
+			nonTagChangeDetected = true
+			return
+		}
+	}
+	return
+}
+
+func (r *resourceJobDefinition) getTagsAllKv(ctx context.Context, val getter) (tagsAll tags.KeyValueTags, diagnostics diag.Diagnostics) {
+	meta := r.Meta()
+	defaultTagsConfig := meta.DefaultTagsConfig(ctx)
+	ignoredTagsConfig := meta.IgnoreTagsConfig(ctx)
+	var resourceTags tags.KeyValueTags
+	resourceTags, diagnostics = r.getResourceTags(ctx, val)
+	if diagnostics.HasError() {
+		return
+	}
+	tagsAll = defaultTagsConfig.MergeTags(resourceTags).IgnoreConfig(ignoredTagsConfig)
+	return
+}
+func (r *resourceJobDefinition) getTagsAllMap(ctx context.Context, val getter) (tagsAll map[string]string, diagnostics diag.Diagnostics) {
+	var tagsAllKv tags.KeyValueTags
+	tagsAllKv, diagnostics = r.getTagsAllKv(ctx, val)
+	if diagnostics.HasError() {
+		return
+	}
+	tagsAll = tagsAllKv.Map()
+	return
+}
+
+// func (r *resourceJobDefinition) getTagsIn(ctx context.Context, plan tfsdk.Plan) (tags, tagsAll map[string]string, diagnostics diag.Diagnostics) {
+// 	meta := r.Meta()
+// 	ctx = meta.RegisterLogger(ctx)
+// 	defaultTagsConfig := meta.DefaultTagsConfig(ctx)
+// 	ignoredTagsConfig := meta.IgnoreTagsConfig(ctx)
+
+// 	var planTags tftags.Map
+// 	diagnostics.Append(plan.GetAttribute(ctx, path.Root(names.AttrTags), &planTags)...)
+
+// 	if diagnostics.HasError() {
+// 		return
+// 	}
+// 	if planTags.IsUnknown() {
+// 		hasUnknownElements := false
+// 		{ // copied from internal/framework/resource_with_configure.go func mapHasUnknownElements
+// 			for _, v := range planTags.Elements() {
+// 				if v.IsUnknown() {
+// 					hasUnknownElements = true
+// 					break
+// 				}
+// 			}
+// 		}
+// 		if !hasUnknownElements {
+// 			resourceTags := tftags.New(ctx, planTags)
+// 			allTags := defaultTagsConfig.MergeTags(resourceTags).IgnoreConfig(ignoredTagsConfig)
+
+// 			diagnostics.Append(plan.SetAttribute(ctx, path.Root(names.AttrTagsAll), flex.FlattenFrameworkStringValueMapLegacy(ctx, allTags.Map()))...)
+// 		} else {
+// 			diagnostics.Append(plan.SetAttribute(ctx, path.Root(names.AttrTagsAll), tftags.Unknown)...)
+// 		}
+// 	}
+
+// 	// model.Tags
+// 	// defaultTagsConfig.MergeTags()
+// 	// ctx = tftags.NewContext(ctx, , )
+// 	// defaultTagsConfig := r.Meta().DefaultTagsConfig(ctx)
+// 	// ignoreTagsConfig := r.Meta().IgnoreTagsConfig(ctx)
+// 	return
+// }
+// func (r *resourceJobDefinition) getTagsOut() {}
+
 func (r *resourceJobDefinition) ModifyPlan(ctx context.Context, request resource.ModifyPlanRequest, response *resource.ModifyPlanResponse) {
-	r.SetTagsAll(ctx, request, response)
+	ctx = tflog.SetField(ctx, "debug-op", "ModifyPlan")
+	r.SetTagsAll(ctx, request, response) // doesn't rely on context; should work?
+	// HACK: (unsuccessfully) try setting and unsetting the ARN
+	// stateArn := types.StringUnknown()
+	// planArn := types.StringUnknown()
+	// arnPath := path.Root(names.AttrARN)
+
+	// if request.State.Raw.IsKnown() {
+	// 	response.Diagnostics.Append(request.State.GetAttribute(ctx, arnPath, &stateArn)...)
+	// }
+	// if request.Plan.Raw.IsKnown() {
+	// 	response.Diagnostics.Append(request.Plan.GetAttribute(ctx, arnPath, &planArn)...)
+	// }
+
+	// edgeCase := request.Plan.Raw.IsKnown() && request.State.Raw.IsKnown() && !(stateArn.IsUnknown() || stateArn.IsNull()) && (planArn.IsUnknown())
+	// if edgeCase {
+	// 	tflog.Debug(ctx, "edge case!!")
+	// 	// temporarily use the old arn to update tags
+	// 	response.Diagnostics.Append(request.Plan.SetAttribute(ctx, arnPath, stateArn)...)
+	// 	if response.Diagnostics.HasError() {
+	// 		return
+	// 	}
+	// }
+
+	// if response.Diagnostics.HasError() {
+	// 	return
+	// }
+
+	// if edgeCase {
+	// 	// restore the unknown value of the incoming arn
+	// 	response.Diagnostics.Append(response.Plan.SetAttribute(ctx, arnPath, types.StringUnknown())...)
+	// }
 }
 
 type resourceJobDefinitionModel struct {

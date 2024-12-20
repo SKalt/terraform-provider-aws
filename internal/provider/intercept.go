@@ -88,6 +88,7 @@ func (s interceptorItems) why(why why) interceptorItems {
 	})
 }
 
+// !!!
 // interceptedHandler returns a handler that invokes the specified CRUD handler, running any interceptors.
 func interceptedHandler[F ~func(context.Context, *schema.ResourceData, any) diag.Diagnostics](bootstrapContext contextFunc, interceptors interceptorItems, f F, why why) F {
 	return func(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
@@ -197,6 +198,7 @@ func (r *wrappedResource) StateUpgrade(f schema.StateUpgradeFunc) schema.StateUp
 
 type tagsCRUDFunc func(context.Context, schemaResourceData, conns.ServicePackage, *types.ServicePackageResourceTags, string, string, any, diag.Diagnostics) (context.Context, diag.Diagnostics)
 
+// !!!
 // tagsResourceInterceptor implements transparent tagging for resources.
 type tagsResourceInterceptor struct {
 	tags       *types.ServicePackageResourceTags
