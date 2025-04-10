@@ -52,31 +52,29 @@ func resourceJobDefinition() *schema.Resource {
 				Type:     schema.TypeString,
 				Computed: true,
 			},
+			// TODO: names.AttrExecutionRoleARN: {},
 			"arn_prefix": {
 				Type:     schema.TypeString,
 				Computed: true,
 			},
 			"container_properties": {
-				Type:          schema.TypeString,
-				Optional:      true,
-				ConflictsWith: []string{"ecs_properties", "eks_properties", "node_properties"},
-				StateFunc: func(v any) string {
-					json, _ := structure.NormalizeJsonString(v)
-					return json
+				Type:     schema.TypeList,
+				MaxItems: 1,
+				Optional: true,
+				ConflictsWith: []string{
+					// "container_properties", // doesn't conflict with itself
+					"ecs_properties",
+					"eks_properties",
+					"node_properties",
 				},
-				DiffSuppressFunc: func(k, old, new string, d *schema.ResourceData) bool {
-					equal, _ := equivalentContainerPropertiesJSON(old, new)
-					return equal
-				},
-				DiffSuppressOnRefresh: true,
-				ValidateFunc:          validJobContainerProperties,
+				Elem: containerPropertiesSchema(),
 			},
 			"deregister_on_new_revision": {
 				Type:     schema.TypeBool,
 				Default:  true,
 				Optional: true,
 			},
-			"ecs_properties": {
+			"ecs_properties": { // FIXME: split
 				Type:          schema.TypeString,
 				Optional:      true,
 				ConflictsWith: []string{"container_properties", "eks_properties", "node_properties"},
@@ -454,7 +452,7 @@ func resourceJobDefinition() *schema.Resource {
 				ForceNew:     true,
 				ValidateFunc: validName,
 			},
-			"node_properties": {
+			"node_properties": { // FIXME: split
 				Type:          schema.TypeString,
 				Optional:      true,
 				ConflictsWith: []string{"container_properties", "ecs_properties", "eks_properties"},
@@ -601,15 +599,18 @@ func jobDefinitionCustomizeDiff(_ context.Context, d *schema.ResourceDiff, meta 
 func needsJobDefUpdate(d *schema.ResourceDiff) bool {
 	if d.HasChange("container_properties") {
 		o, n := d.GetChange("container_properties")
+		if o == nil || n == nil {
+			return true
+		}
+		before := containerProperties(*expandContainerProperties(o.(map[string]any)))
+		after := containerProperties(*expandContainerProperties(n.(map[string]any)))
 
-		equivalent, err := equivalentContainerPropertiesJSON(o.(string), n.(string))
+		equivalent, err := before.equalTo(&after)
 		if err != nil {
 			return false
 		}
 
-		if !equivalent {
-			return true
-		}
+		return !equivalent
 	}
 
 	if d.HasChange("ecs_properties") {
@@ -739,13 +740,10 @@ func resourceJobDefinitionCreate(ctx context.Context, d *schema.ResourceData, me
 		}
 
 		if v, ok := d.GetOk("container_properties"); ok {
-			props, err := expandContainerProperties(v.(string))
-			if err != nil {
-				return sdkdiag.AppendFromErr(diags, err)
-			}
+			props := expandContainerProperties(v.([]any)[0].(map[string]any))
 
 			diags = append(diags, removeEmptyEnvironmentVariables(props.Environment, cty.GetAttrPath("container_properties"))...)
-			input.ContainerProperties = props
+			input.ContainerProperties = &props
 		}
 
 		if v, ok := d.GetOk("ecs_properties"); ok {
@@ -848,10 +846,7 @@ func resourceJobDefinitionRead(ctx context.Context, d *schema.ResourceData, meta
 	arn, revision := aws.ToString(jobDefinition.JobDefinitionArn), aws.ToInt32(jobDefinition.Revision)
 	d.Set(names.AttrARN, arn)
 	d.Set("arn_prefix", strings.TrimSuffix(arn, fmt.Sprintf(":%d", revision)))
-	containerProperties, err := flattenContainerProperties(jobDefinition.ContainerProperties)
-	if err != nil {
-		return sdkdiag.AppendFromErr(diags, err)
-	}
+	containerProperties := flattenContainerProperties(jobDefinition.ContainerProperties)
 	d.Set("container_properties", containerProperties)
 	ecsProperties, err := flattenECSProperties(jobDefinition.EcsProperties)
 	if err != nil {
@@ -911,10 +906,7 @@ func resourceJobDefinitionUpdate(ctx context.Context, d *schema.ResourceData, me
 		switch jobDefinitionType {
 		case awstypes.JobDefinitionTypeContainer:
 			if v, ok := d.GetOk("container_properties"); ok {
-				props, err := expandContainerProperties(v.(string))
-				if err != nil {
-					return sdkdiag.AppendFromErr(diags, err)
-				}
+				props := expandContainerProperties(v.([]interface{})[0].(map[string]interface{}))
 
 				diags = append(diags, removeEmptyEnvironmentVariables(props.Environment, cty.GetAttrPath("container_properties"))...)
 				input.ContainerProperties = props
@@ -1093,17 +1085,8 @@ func findJobDefinitions(ctx context.Context, conn *batch.Client, input *batch.De
 	return output, nil
 }
 
-func validJobContainerProperties(v interface{}, k string) (ws []string, errors []error) {
-	value := v.(string)
-	_, err := expandContainerProperties(value)
-	if err != nil {
-		errors = append(errors, fmt.Errorf("AWS Batch Job container_properties is invalid: %s", err))
-	}
-	return
-}
-
 func validJobECSProperties(v interface{}, k string) (ws []string, errors []error) {
-	value := v.(string)
+	value := v.(string) // FIXME: update
 	_, err := expandECSProperties(value)
 	if err != nil {
 		errors = append(errors, fmt.Errorf("AWS Batch Job ecs_properties is invalid: %s", err))
@@ -1112,7 +1095,7 @@ func validJobECSProperties(v interface{}, k string) (ws []string, errors []error
 }
 
 func validJobNodeProperties(v interface{}, k string) (ws []string, errors []error) {
-	value := v.(string)
+	value := v.(string) // FIXME: update
 	_, err := expandJobNodeProperties(value)
 	if err != nil {
 		errors = append(errors, fmt.Errorf("AWS Batch Job node_properties is invalid: %s", err))
